@@ -1,0 +1,30 @@
+stages:
+  - build
+  - test
+  - deploy
+  - dast
+
+include:
+  - template: Security/DAST.gitlab-ci.yml
+
+build_job:
+  stage: build
+  script:
+    - echo "Building app..."
+
+test_job:
+  stage: test
+  script:
+    - echo "Running tests..."
+
+deploy_job:
+  stage: deploy
+  script:
+    - echo "Deploying app..."
+
+dast:
+  stage: dast
+  variables:
+    DAST_TARGET_URL: "https://example.com"
+  rules:
+    - when: manual
