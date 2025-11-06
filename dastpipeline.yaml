@@ -22,9 +22,31 @@ deploy_job:
   script:
     - echo "Deploying app..."
 
+
 dast:
   stage: dast
   variables:
-    DAST_TARGET_URL: "https://example.com"
+    DAST_TARGET_URL: "https://dev-app.example.com"
+    DAST_FULL_SCAN_ENABLED: "true"
+    DAST_AUTH_URL: "https://dev-app.example.com/login"
+    DAST_AUTH_USERNAME: "admin@tanuki.local"
+    DAST_AUTH_PASSWORD: "admin123"
+    DAST_AUTH_USERNAME_FIELD: "css:input[id=email]"
+    DAST_AUTH_PASSWORD_FIELD: "css:input[id=password]"
+    DAST_AUTH_SUBMIT_FIELD: "css:button[id=loginButton]"
+    DAST_AUTH_REPORT: "true"
+
+    # DAST_EXCLUDE_URLS: "https://dev-app.com/logout"
+    DAST_CRAWL_GRAPH: "true"
+   
+  artifacts:
+    reports:
+      dast: gl-dast-report.json
+    paths:
+      - gl-dast-report.json
+      - gl-dast-debug.log
+      - gl-dast-crawl.svg
+    expire_in: 2 weeks
+
   rules:
     - when: manual
