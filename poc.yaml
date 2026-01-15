@@ -1,0 +1,240 @@
+# .gitlab-ci.yml
+# Drop-in, single-file GitLab CI job that runs on Linux runners.
+# - Writes an inline diagnostic probe script (bash)
+# - Runs DNS / TCP / TLS / HTTP checks with robust error handling
+# - Produces a job artifact (dast_probe.log) for easy download
+# - Manual job in 'dast' stage; safe to reuse in restricted environments
+#
+# Override the variables DAST_TARGET_URL and DAST_TIMEOUT in CI/CD variables
+# in GitLab for your environment.
+
+stages:
+  - dast
+
+include:
+  - template: Security/DAST.gitlab-ci.yml
+
+variables:
+  # Default target - override per-pipeline or in CI/CD variables
+  DAST_TARGET_URL: "https://example9009090909090909.com"
+  # Timeout (seconds) for network operations
+  DAST_TIMEOUT: "15"
+
+dast_probe:
+  stage: dast
+  # manual trigger so you can run when needed
+  rules:
+    - when: manual
+  allow_failure: true
+  artifacts:
+    paths:
+      - dast_probe.log
+    expire_in: 1 day
+  before_script:
+    - set -euo pipefail
+    - echo "Preparing DAST probe (target=$DAST_TARGET_URL, timeout=$DAST_TIMEOUT)"
+  script:
+    # create an inline bash probe so there is nothing to copy separately
+    - |
+      cat > dast_probe.sh <<'BASH'
+      #!/usr/bin/env bash
+      # Lightweight DAST reachability probe (single-file)
+      # Usage: ./dast_probe.sh <target_url> <timeout_seconds>
+      set -o pipefail
+      TARGET_URL="${1:-}"
+      TIMEOUT="${2:-15}"
+      LOGFILE="dast_probe.log"
+
+      # ensure log file exists and write header
+      exec > >(tee -a "$LOGFILE") 2>&1
+      echo "=== DAST probe start: $(date -u +"%Y-%m-%dT%H:%M:%SZ") ==="
+      echo "Target URL: ${TARGET_URL}"
+      echo "Timeout: ${TIMEOUT}s"
+      echo
+
+      if [[ -z "$TARGET_URL" ]]; then
+        echo "ERROR: No TARGET_URL supplied. Exiting."
+        echo "=== DAST probe end ==="
+        exit 2
+      fi
+
+      # helper to test command presence
+      has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+      # parse host and port
+      parse_host_port() {
+        local url="$1"
+        local no_scheme="${url#*://}"
+        local hostport="${no_scheme%%/*}"
+        if [[ "$hostport" == *:* ]]; then
+          HOST="${hostport%%:*}"
+          PORT="${hostport##*:}"
+        else
+          HOST="$hostport"
+          if [[ "$url" =~ ^http:// ]]; then
+            PORT="80"
+          else
+            PORT="443"
+          fi
+        fi
+      }
+      parse_host_port "$TARGET_URL"
+      echo "Parsed host: $HOST"
+      echo "Parsed port: $PORT"
+      echo
+
+      # Proxy env
+      echo "--- Proxy environment ---"
+      env | grep -Ei 'http_proxy|https_proxy|no_proxy' || echo "(no proxy env vars detected)"
+      echo
+
+      # DNS resolution
+      echo "--- DNS resolution ---"
+      DNS_OK=0
+      if has_cmd dig; then
+        echo "dig +short $HOST"
+        dig +short "$HOST" || true
+        if dig +short "$HOST" | grep -q '[0-9]'; then DNS_OK=1; fi
+      elif has_cmd nslookup; then
+        echo "nslookup $HOST"
+        nslookup "$HOST" || true
+        if nslookup "$HOST" | grep -q 'Address'; then DNS_OK=1; fi
+      elif has_cmd getent; then
+        echo "getent hosts $HOST"
+        getent hosts "$HOST" || true
+        if getent hosts "$HOST" | grep -q "$HOST"; then DNS_OK=1; fi
+      else
+        echo "No dns tool (dig/nslookup/getent) available; DNS check skipped."
+      fi
+      echo "DNS_OK=${DNS_OK}"
+      echo
+
+      # Ping (may be blocked)
+      echo "--- Ping (ICMP) ---"
+      if has_cmd ping; then
+        ping -c 3 -W 2 "$HOST" >/dev/null 2>&1 && echo "ICMP ping OK" || echo "Ping failed or disabled (ICMP may be blocked)."
+      else
+        echo "ping command not available."
+      fi
+      echo
+
+      # TCP connect
+      echo "--- TCP connect (port $PORT) ---"
+      TCP_OK=0
+      if has_cmd nc; then
+        if nc -z -w "$TIMEOUT" "$HOST" "$PORT" >/dev/null 2>&1; then
+          echo "nc: TCP connect succeeded"
+          TCP_OK=1
+        else
+          echo "nc: TCP connect failed"
+        fi
+      elif has_cmd timeout && has_cmd bash && has_cmd /dev/tcp/localhost 2>/dev/null; then
+        # fallback using bash /dev/tcp if available (not common in containers without permissive shells)
+        (timeout "$TIMEOUT" bash -c "cat < /dev/tcp/$HOST/$PORT" ) >/dev/null 2>&1 && { echo "Bash /dev/tcp connect succeeded"; TCP_OK=1; } || echo "Bash /dev/tcp connect failed"
+      else
+        echo "nc not available; attempting curl to test connect"
+        if has_cmd curl; then
+          if curl --connect-timeout "$TIMEOUT" -I -m "$TIMEOUT" --silent --show-error "$TARGET_URL" >/dev/null 2>&1; then
+            echo "curl: connect + HTTP OK (HEAD returned)"
+            TCP_OK=1
+          else
+            echo "curl: connect or HTTP HEAD failed"
+          fi
+        else
+          echo "No nc or curl available to test TCP."
+        fi
+      fi
+      echo "TCP_OK=${TCP_OK}"
+      echo
+
+      # TLS handshake & certificate (if port looks like TLS)
+      echo "--- TLS handshake & certificate ---"
+      TLS_OK=0
+      if [[ "$PORT" == "443" || "$PORT" == "8443" || "$TARGET_URL" =~ ^https:// ]]; then
+        if has_cmd openssl; then
+          # run openssl s_client with timeout (if timeout exists)
+          if has_cmd timeout; then
+            timeout "$TIMEOUT" openssl s_client -servername "$HOST" -connect "$HOST:$PORT" -brief </dev/null 2>&1 | sed -n '1,200p' || true
+          else
+            openssl s_client -servername "$HOST" -connect "$HOST:$PORT" </dev/null 2>&1 | sed -n '1,200p' || true
+          fi
+          # try to print cert details
+          if has_cmd timeout; then
+            timeout "$TIMEOUT" bash -c "echo | openssl s_client -servername '$HOST' -connect '$HOST:$PORT' 2>/dev/null | openssl x509 -noout -subject -issuer -dates" || true
+          else
+            bash -c "echo | openssl s_client -servername '$HOST' -connect '$HOST:$PORT' 2>/dev/null | openssl x509 -noout -subject -issuer -dates" || true
+          fi
+          TLS_OK=1
+        else
+          echo "openssl not available; TLS check skipped."
+        fi
+      else
+        echo "Non-TLS port detected; skipping TLS handshake."
+      fi
+      echo "TLS_OK=${TLS_OK}"
+      echo
+
+      # HTTP request with verbose trace via curl/wget
+      echo "--- HTTP request (verbose) ---"
+      HTTP_OK=0
+      HTTP_CODE="n/a"
+      if has_cmd curl; then
+        TRACEFILE=$(mktemp)
+        BODYFILE=$(mktemp)
+        set +e
+        curl --max-time "$TIMEOUT" --connect-timeout "$TIMEOUT" -v --trace-ascii "$TRACEFILE" --write-out "%{http_code}" --silent --show-error --output "$BODYFILE" "$TARGET_URL"
+        CURL_EXIT=$?
+        set -e
+        echo "curl exit code: $CURL_EXIT"
+        echo "curl trace (head):"
+        if [[ -s "$TRACEFILE" ]]; then sed -n '1,240p' "$TRACEFILE"; fi
+        HTTP_CODE=$(tail -n 1 "$TRACEFILE" 2>/dev/null || echo "")
+        echo "response body (first 8k):"
+        if [[ -s "$BODYFILE" ]]; then head -c 8192 "$BODYFILE" || true; fi
+        rm -f "$TRACEFILE" "$BODYFILE"
+        if [[ "$CURL_EXIT" -eq 0 ]]; then HTTP_OK=1; fi
+      elif has_cmd wget; then
+        set +e
+        wget --server-response --timeout="$TIMEOUT" --tries=1 -O - "$TARGET_URL" 2>&1 | sed -n '1,240p'
+        WGET_EXIT=$?
+        set -e
+        if [[ "$WGET_EXIT" -eq 0 ]]; then HTTP_OK=1; fi
+      else
+        echo "No curl/wget available to perform HTTP request."
+      fi
+      echo "HTTP_OK=${HTTP_OK} HTTP_CODE=${HTTP_CODE}"
+      echo
+
+      # traceroute
+      echo "--- Traceroute ---"
+      if has_cmd traceroute; then
+        traceroute -w 2 -q 1 "$HOST" || echo "traceroute incomplete or not permitted"
+      else
+        echo "traceroute not available."
+      fi
+      echo
+
+      # Quick hints summary
+      echo "--- Quick diagnosis hints ---"
+      if [[ "$DNS_OK" -ne 1 ]]; then
+        echo "- DNS resolution did NOT return addresses for $HOST. Check runner DNS config, split-horizon, or /etc/hosts."
+      fi
+      if [[ "$TCP_OK" -ne 1 ]]; then
+        echo "- TCP connect to $HOST:$PORT failed. Likely egress firewall or blocked port from runner network."
+      fi
+      if [[ "$TLS_OK" -ne 1 && "$TARGET_URL" =~ ^https:// ]]; then
+        echo "- TLS handshake was not successfully observed. Could be openssl missing or TLS interception/proxy."
+      fi
+      if [[ "$HTTP_OK" -ne 1 ]]; then
+        echo "- HTTP request failed. If DNS and TCP were OK, check proxy requirements, certificate trust, or server behavior."
+      fi
+
+      echo
+      echo "=== DAST probe end: $(date -u +"%Y-%m-%dT%H:%M:%SZ") ==="
+      # Keep exit 0 so that logs are preserved and the job is informational (CI job won't fail pipeline due to probe)
+      exit 0
+      BASH
+    - chmod +x dast_probe.sh
+    - ./dast_probe.sh "$DAST_TARGET_URL" "$DAST_TIMEOUT"
+  after_script:
+    - echo "Probe finished. Artifact dast_probe.log"
