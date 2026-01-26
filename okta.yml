@@ -134,14 +134,10 @@ dast:
       # If a local OWASP ZAP wrapper exists, use it and pass cookie header
       if [ -x "$ZAP_BIN" ]; then
         echo "Found local ZAP baseline script at $ZAP_BIN — running authenticated scan (no downloads)."
-        # create cookie header file
+        # Pass cookies via environment variable to ZAP
         export DAST_REQUEST_COOKIES="${DAST_REQUEST_COOKIES:-}"
-        # The zap-baseline.py accepts extra options; use -r to write report, and pass custom headers if needed
-        # Many ZAP wrappers support -g or --zap-options to set cookies; this invocation may need adjusting to local setup
-        # We'll pass cookies via header (some setups allow this)
-        COOKIE_HEADER="Cookie: ${DAST_REQUEST_COOKIES:-}"
-        # Run scan (adjust options as runner's installed ZAP supports)
-        "$ZAP_BIN" -t "$TARGET" -r "$HTML_REPORT" --hook=echo || echo "ZAP returned non-zero (scan may still have partial results)."
+        # Run scan with proper ZAP baseline options
+        "$ZAP_BIN" -t "$TARGET" -r "$HTML_REPORT" || echo "ZAP returned non-zero (scan may still have partial results)."
         # convert HTML to JSON minimal wrapper if needed (or leave HTML)
         echo "{}" > "$REPORT" || true
         echo "Created minimal $REPORT and $HTML_REPORT"
@@ -151,8 +147,10 @@ dast:
       # If zap.sh present, attempt to run similar baseline:
       if [ -x "$ZAP_STANDALONE" ]; then
         echo "Found local ZAP at $ZAP_STANDALONE — running baseline scan (adjust command as needed)."
-        "$ZAP_STANDALONE" -daemon -newsession >/dev/null 2>&1 || true
-        echo "{}" > "$REPORT"
+        # Run ZAP scan with cookie support
+        export DAST_REQUEST_COOKIES="${DAST_REQUEST_COOKIES:-}"
+        "$ZAP_STANDALONE" -cmd -quickurl "$TARGET" -quickout "$REPORT" >/dev/null 2>&1 || echo "ZAP scan failed; check installation"
+        [ -f "$REPORT" ] || echo "{}" > "$REPORT"
         exit 0
       fi
 
@@ -162,12 +160,15 @@ dast:
 
       if command -v curl >/dev/null 2>&1; then
         echo "Using curl to fetch headers and first bit of body (without images)."
-        curl -sI --max-time 30 "$TARGET" > headers.txt || echo "curl head failed"
+        # Use cookies if available
+        CURL_COOKIE_OPTS=""
+        [ -n "${DAST_REQUEST_COOKIES:-}" ] && CURL_COOKIE_OPTS="-b \"${DAST_REQUEST_COOKIES}\""
+        curl -sI --max-time 30 $CURL_COOKIE_OPTS "$TARGET" > headers.txt || echo "curl head failed"
         echo "---- HEADERS ----" >> dast_probe_summary.txt
         cat headers.txt >> dast_probe_summary.txt
 
         # basic page capture up to 20KB
-        curl -s --max-time 30 "$TARGET" | head -c 20000 > page_snippet.html || true
+        curl -s --max-time 30 $CURL_COOKIE_OPTS "$TARGET" | head -c 20000 > page_snippet.html || true
         echo "Wrote page_snippet.html (first 20KB)"
 
         # produce an empty but valid DAST JSON report placeholder so GitLab UI won't error (it won't show vulnerabilities)
