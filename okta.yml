@@ -9,7 +9,7 @@ okta_get_session:
     APP_URL: "https://your-app.example.com"
   script:
     - |
-      set -euo pipefail
+      set -eo pipefail
 
       # --------------------------------------------------
       # HARD-CODED OKTA CREDENTIALS (PoC ONLY)
@@ -17,11 +17,6 @@ okta_get_session:
       OKTA_TEST_USER="poc-dast-user@company.com"
       OKTA_TEST_PASS="PocPassword123!"
       echo "# default empty dotenv" > dast_env_vars.env
-      finish() {
-        [ -f dast_env_vars.env ] || echo "# no cookie" > dast_env_vars.env
-      }
-      trap finish EXIT
-
       echo "Detecting available JSON parsers..."
       if command -v jq >/dev/null 2>&1; then
         PARSER="jq"
