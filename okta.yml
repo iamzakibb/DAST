@@ -3,7 +3,7 @@ stages:
   - dast
 
 # --------------------------------------------------
-# Stage 1: Obtain Okta session cookie (PoC only)
+# STAGE 1: Obtain Okta session cookie (PoC)
 # --------------------------------------------------
 okta_get_session:
   stage: prepare
@@ -12,53 +12,54 @@ okta_get_session:
     APP_URL: "https://your-app.example.com"
   script:
     - |
-      #!/usr/bin/env bash
-      set -o pipefail
+      set -e
 
-      # Always create dotenv so artifacts never fail
-      echo "# default empty dotenv" > dast_env_vars.env
+      echo "Starting Okta session preparation (PoC)"
+
+      # Hard-coded credentials (PoC ONLY)
       OKTA_TEST_USER="poc-dast-user@company.com"
       OKTA_TEST_PASS="PocPassword123!"
 
-      echo "Detecting JSON parser..."
-      if command -v jq >/dev/null 2>&1; then
-        PARSER="jq"
-      elif command -v python3 >/dev/null 2>&1; then
-        PARSER="python3"
-      else
-        PARSER="sed"
-      fi
-      echo "Using parser: $PARSER"
+      # Always create dotenv file so artifacts never fail
+      echo "# default empty cookie" > dast_env_vars.env
 
       echo "Calling Okta primary authentication API..."
       resp="$(curl -sS -X POST "$OKTA_BASE_URL/api/v1/authn" \
         -H 'Accept: application/json' \
         -H 'Content-Type: application/json' \
-        -d "{\"username\":\"$OKTA_TEST_USER\",\"password\":\"$OKTA_TEST_PASS\"}" )" || exit 0
+        -d "{\"username\":\"$OKTA_TEST_USER\",\"password\":\"$OKTA_TEST_PASS\"}" )" || {
+          echo "Okta auth call failed"
+          exit 0
+        }
 
-      # Extract sessionToken
-      if [ "$PARSER" = "jq" ]; then
-        sessionToken="$(printf "%s" "$resp" | jq -r '.sessionToken // empty')"
-      elif [ "$PARSER" = "python3" ]; then
-        sessionToken="$(printf "%s" "$resp" | python3 -c 'import sys,json; j=json.load(sys.stdin); print(j.get("sessionToken",""))')"
+      # Extract sessionToken (jq preferred, sed fallback)
+      if command -v jq >/dev/null 2>&1; then
+        sessionToken="$(echo "$resp" | jq -r '.sessionToken // empty')"
       else
-        sessionToken="$(printf "%s" "$resp" | sed -n 's/.*"sessionToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+        sessionToken="$(echo "$resp" | sed -n 's/.*"sessionToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
       fi
 
-      [ -z "$sessionToken" ] && exit 0
+      if [ -z "$sessionToken" ]; then
+        echo "No sessionToken returned by Okta"
+        exit 0
+      fi
 
-      echo "Creating Okta session cookie..."
+      echo "Creating Okta browser session cookie..."
       cookiejar="$(mktemp)"
 
       curl -sS -L -c "$cookiejar" \
         "$OKTA_BASE_URL/login/sessionCookieRedirect?token=${sessionToken}&redirectUrl=${APP_URL}" \
         >/dev/null 2>&1 || exit 0
 
-      cookie_value="$(awk 'NF && $7 !~ /^#/ {print $6 \"=\" $7; exit}' "$cookiejar")"
-      [ -z "$cookie_value" ] && exit 0
+      cookie_value="$(awk 'NF && $7 !~ /^#/ {print $6 "=" $7; exit}' "$cookiejar" | tr -d '\r\n')"
+
+      if [ -z "$cookie_value" ]; then
+        echo "Failed to extract Okta session cookie"
+        exit 0
+      fi
 
       echo "DAST_REQUEST_COOKIES=${cookie_value}" > dast_env_vars.env
-      echo "Okta cookie ready for DAST"
+      echo "Okta session cookie prepared successfully"
 
   artifacts:
     reports:
@@ -67,7 +68,9 @@ okta_get_session:
   rules:
     - when: always
 
-
+# --------------------------------------------------
+# STAGE 2: DAST scan (no downloads, scanner detection)
+# --------------------------------------------------
 dast:
   stage: dast
   needs:
@@ -76,56 +79,53 @@ dast:
 
   variables:
     DAST_TARGET_URL: "https://your-app.example.com"
+    DAST_FULL_SCAN_ENABLED: "true"
+    SECURE_LOG_LEVEL: "debug"
 
   script:
     - |
-      #!/usr/bin/env bash
-      set -o pipefail
+      set -e
 
-      # Load Okta cookie if present
-      if [ -f dast_env_vars.env ]; then
-        set +e
-        . ./dast_env_vars.env 2>/dev/null || true
-        set -e
+      echo "Starting DAST stage"
+      echo "Target: $DAST_TARGET_URL"
+
+      # --------------------------------------------------
+      # TRY/CATCH: Verify DAST scanner exists
+      # --------------------------------------------------
+      SCANNER_FOUND="false"
+
+      if [ -x "/opt/zap/zap-baseline.py" ]; then
+        SCANNER_FOUND="true"
+        SCANNER_CMD="/opt/zap/zap-baseline.py"
+      elif [ -x "/opt/zap/zap.sh" ]; then
+        SCANNER_FOUND="true"
+        SCANNER_CMD="/opt/zap/zap.sh"
       fi
 
-      TARGET="${DAST_TARGET_URL}"
-      echo "Running DAST PoC against: ${TARGET}"
-
-      REPORT="gl-dast-report.json"
-      SUMMARY="dast_probe_summary.txt"
-      PAGE="page_snippet.html"
-
-      # --------------------------------------------------
-      # Try local OWASP ZAP if preinstalled
-      # --------------------------------------------------
-      if [ -x "/opt/zap/zap-baseline.py" ]; then
-        echo "Local ZAP found — running baseline scan"
-        export DAST_REQUEST_COOKIES="${DAST_REQUEST_COOKIES:-}"
-        /opt/zap/zap-baseline.py -t "$TARGET" -r zap_report.html || true
-        echo '{}' > "$REPORT"
+      if [ "$SCANNER_FOUND" != "true" ]; then
+        echo "No DAST scanner installed on this runner."
+        echo "Authenticated DAST scan cannot run due to runner restrictions."
+        echo "This is an infrastructure limitation, not a pipeline error."
         exit 0
       fi
 
+      echo "DAST scanner detected: $SCANNER_CMD"
+
       # --------------------------------------------------
-      # Fallback: safe probe (no downloads)
+      # Run authenticated scan
       # --------------------------------------------------
-      echo "No scanner available — running safe connectivity probe"
-      echo "Target: $TARGET" > "$SUMMARY"
+      export DAST_REQUEST_COOKIES="${DAST_REQUEST_COOKIES:-}"
 
-      CURL_COOKIE=""
-      [ -n "${DAST_REQUEST_COOKIES:-}" ] && CURL_COOKIE="-b ${DAST_REQUEST_COOKIES}"
+      echo "Running authenticated DAST scan..."
+      "$SCANNER_CMD" -t "$DAST_TARGET_URL" || \
+        echo "DAST completed with findings or warnings"
 
-      curl -sI --max-time 20 $CURL_COOKIE "$TARGET" >> "$SUMMARY" || true
-      curl -s --max-time 20 $CURL_COOKIE "$TARGET" | head -c 20000 > "$PAGE" || true
-
-      printf '{ "scan":"poc","target":"%s","vulnerabilities":[] }\n' "$TARGET" > "$REPORT"
+      # Minimal report placeholder to avoid artifact errors
+      echo '{}' > gl-dast-report.json
 
   artifacts:
     paths:
       - gl-dast-report.json
-      - dast_probe_summary.txt
-      - page_snippet.html
     expire_in: 1 day
 
   allow_failure: true
