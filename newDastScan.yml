@@ -1,0 +1,128 @@
+stages:
+  - dast
+
+variables:
+  TARGET_URL: "https://example.com"
+  LOG_DIR: "dast_logs"
+  ARTIFACT_DIR: "dast_artifacts"
+
+dast_scan:
+  stage: dast
+  retry: 1
+  timeout: 30m
+  allow_failure: false
+
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - ${LOG_DIR}/
+      - ${ARTIFACT_DIR}/
+
+  script: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    echo "=== DAST Connectivity Test Start ==="
+    echo "Time: $(date)"
+
+    mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}"
+
+    RUN_LOG="${LOG_DIR}/run.log"
+    DIAG_LOG="${LOG_DIR}/diagnostics.txt"
+
+    ############################
+    # System Diagnostics
+    ############################
+    {
+      echo "===== SYSTEM INFO ====="
+      uname -a
+      df -h
+      ulimit -a
+      echo "===== ENVIRONMENT (masked) ====="
+      env | sed -E 's/(PASS|SECRET|TOKEN|KEY|PWD)=.*/\1=****MASKED****/Ig'
+      echo "==============================="
+    } > "${DIAG_LOG}" 2>&1 || true
+
+    ############################
+    # DNS Resolution
+    ############################
+    echo "===== DNS CHECK =====" | tee -a "${DIAG_LOG}"
+
+    if command -v host >/dev/null 2>&1; then
+      host "${TARGET_URL#*://}" >> "${DIAG_LOG}" 2>&1 || true
+    elif command -v nslookup >/dev/null 2>&1; then
+      nslookup "${TARGET_URL#*://}" >> "${DIAG_LOG}" 2>&1 || true
+    else
+      echo "No DNS utility available" >> "${DIAG_LOG}"
+    fi
+
+    ############################
+    # Connectivity Test (Hard Fail if unreachable)
+    ############################
+    echo "===== CONNECTIVITY TEST =====" | tee -a "${DIAG_LOG}"
+
+    if ! curl -I --max-time 15 --verbose "${TARGET_URL}" \
+        -D "${LOG_DIR}/headers_head.txt" \
+        -o /dev/null \
+        >> "${LOG_DIR}/curl_head_verbose.log" 2>&1; then
+
+        echo "Target not reachable" | tee -a "${DIAG_LOG}"
+        exit 10
+    fi
+
+    echo "✔ Target reachable" | tee -a "${DIAG_LOG}"
+
+    ############################
+    # Full GET Request Capture
+    ############################
+    curl -L --max-time 60 --verbose "${TARGET_URL}" \
+      -D "${LOG_DIR}/headers_get.txt" \
+      -o "${LOG_DIR}/body_get.html" \
+      >> "${LOG_DIR}/curl_get_verbose.log" 2>&1 || true
+
+    ############################
+    # TLS Certificate Dump (if HTTPS + openssl exists)
+    ############################
+    if [[ "${TARGET_URL}" == https* ]] && command -v openssl >/dev/null 2>&1; then
+      host_port="${TARGET_URL#*://}"
+      host_port="${host_port%%/*}"
+      host="${host_port%%:*}"
+      port="${host_port#*:}"
+
+      if [ "${host}" = "${port}" ]; then
+        port=443
+      fi
+
+      echo "===== TLS CERTIFICATE =====" >> "${DIAG_LOG}"
+      echo | openssl s_client -connect "${host}:${port}" -servername "${host}" 2>/dev/null \
+        | openssl x509 -noout -subject -issuer -dates -fingerprint \
+        >> "${DIAG_LOG}" 2>&1 || true
+    fi
+
+    ############################
+    # Basic Security Header Check
+    ############################
+    {
+      echo "===== SECURITY HEADERS ====="
+      grep -Ei "Strict-Transport-Security|Content-Security-Policy|X-Frame-Options|X-Content-Type-Options|Referrer-Policy" "${LOG_DIR}/headers_get.txt" || echo "No common security headers found"
+      echo "===== SERVER HEADER ====="
+      grep -i "^Server:" "${LOG_DIR}/headers_get.txt" || true
+    } >> "${DIAG_LOG}" 2>&1 || true
+
+    ############################
+    # Common Path Probing
+    ############################
+    echo "===== COMMON ENDPOINT PROBE =====" >> "${DIAG_LOG}"
+
+    for path in /robots.txt /sitemap.xml /.git/ /.env /admin /login /config ; do
+      code=$(curl -L --max-time 15 -o /dev/null -s -w "%{http_code}" "${TARGET_URL}${path}" || echo "000")
+      echo "${path} -> HTTP ${code}" >> "${DIAG_LOG}"
+    done
+
+    ############################
+    # Archive Logs
+    ############################
+    tar -czf "${ARTIFACT_DIR}/dast_logs_${CI_PIPELINE_ID:-manual}.tar.gz" -C "${LOG_DIR}" . || true
+
+    echo "=== DAST Connectivity Test Complete ==="
