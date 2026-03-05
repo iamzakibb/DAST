@@ -1,0 +1,230 @@
+stages:
+  - okta-auth
+
+variables:
+  # REQUIRED: set these as protected CI variables in GitLab settings
+  OKTA_DOMAIN: "banks.okta.com"    # e.g. banks.okta.com
+  OKTA_USERNAME: ""
+  OKTA_PASSWORD: ""
+  # The protected target you want to verify access to after obtaining cookie
+  TARGET_URL: "https://protected-app.example.com/"
+
+  # Local paths
+  LOG_DIR: "okta_logs"
+  ARTIFACT_DIR: "okta_artifacts"
+
+okta_session_no_redirect:
+  stage: okta-auth
+  retry: 1
+  timeout: 30m
+  allow_failure: false
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - ${LOG_DIR}/
+      - ${ARTIFACT_DIR}/
+
+  script: |-
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # ---- quick var checks (fail early if missing) ----
+    : "${OKTA_DOMAIN:?OKTA_DOMAIN must be set in CI variables}"
+    : "${OKTA_USERNAME:?OKTA_USERNAME must be set in CI variables}"
+    : "${OKTA_PASSWORD:?OKTA_PASSWORD must be set in CI variables}"
+    : "${TARGET_URL:?TARGET_URL must be set in CI variables}"
+
+    mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}"
+
+    AUTHN_JSON="${LOG_DIR}/authn_response.json"
+    SESS_JSON="${LOG_DIR}/sessions_response.json"
+    COOKIE_JAR="${LOG_DIR}/okta_cookiejar.txt"
+    SESS_HEADERS="${LOG_DIR}/sessions_headers.txt"
+    PROTECTED_BODY="${LOG_DIR}/protected_body.html"
+    PROTECTED_HDRS="${LOG_DIR}/protected_headers.txt"
+    RUN_LOG="${LOG_DIR}/run.log"
+    DIAG="${LOG_DIR}/diagnostics.txt"
+
+    echo "=== OKTA session check job started ===" | tee -a "${RUN_LOG}"
+    date --iso-8601=seconds >> "${RUN_LOG}" || true
+
+    # Helper: masked env dump for diagnostics (avoid leaking password)
+    mask_env() {
+      env | sed -E 's/(OKTA_PASSWORD|PASSWORD|PASS|SECRET|TOKEN|KEY)=.*/\1=****MASKED****/Ig'
+
+    # Trap to collect diagnostics & always archive artifacts
+
+    finish() {
+      rc=$?
+      echo "Job exit code: ${rc}" >> "${RUN_LOG}" || true
+      {
+        echo "===== RUN LOG (tail) ====="
+        tail -n 200 "${RUN_LOG}" 2>/dev/null || true
+        echo "===== AUTHN RESPONSE ====="
+        sed -n '1,400p' "${AUTHN_JSON}" 2>/dev/null || true
+        echo "===== SESSIONS RESPONSE ====="
+        sed -n '1,200p' "${SESS_JSON}" 2>/dev/null || true
+        echo "===== COOKIE JAR ====="
+        sed -n '1,200p' "${COOKIE_JAR}" 2>/dev/null || true
+        echo "===== PROTECTED HEADERS ====="
+        sed -n '1,200p' "${PROTECTED_HDRS}" 2>/dev/null || true
+        echo "===== MASKED ENV ====="
+        mask_env
+      } > "${DIAG}" 2>&1 || true
+
+      tar -czf "${ARTIFACT_DIR}/okta_logs_${CI_PIPELINE_ID:-manual}.tar.gz" -C "${LOG_DIR}" . || true
+
+      return ${rc}
+    }
+    trap finish EXIT
+
+    # -------------------------
+    # 1) Connectivity to Okta
+    # -------------------------
+    echo "[1] Checking Okta reachability: https://${OKTA_DOMAIN}" | tee -a "${RUN_LOG}"
+    if ! curl -sS --max-time 10 -I "https://${OKTA_DOMAIN}" > "${LOG_DIR}/okta_head.txt" 2>"${LOG_DIR}/okta_head_err.txt"; then
+      echo "ERROR: Cannot reach Okta domain https://${OKTA_DOMAIN}. Check network/DNS/firewall." | tee -a "${RUN_LOG}"
+      exit 30
+    fi
+    echo "[1] Okta reachable" | tee -a "${RUN_LOG}"
+
+    # -------------------------
+    # 2) Primary authn to get sessionToken
+    # -------------------------
+    echo "[2] Calling Primary Authn API to obtain sessionToken" | tee -a "${RUN_LOG}"
+
+    # create JSON payload programmatically to avoid quoting pitfalls
+    authn_payload_file="$(mktemp)"
+    printf '{"username":"%s","password":"%s"}\n' "${OKTA_USERNAME}" "${OKTA_PASSWORD}" > "${authn_payload_file}"
+
+    set +e
+    curl -sS -X POST "https://${OKTA_DOMAIN}/api/v1/authn" \
+      -H "Accept: application/json" -H "Content-Type: application/json" \
+      --data "@${authn_payload_file}" \
+      -o "${AUTHN_JSON}"
+    authn_rc=$?
+    set -e
+    rm -f "${authn_payload_file}"
+
+    if [ "${authn_rc}" -ne 0 ]; then
+      echo "ERROR: Authn API curl failed (rc=${authn_rc}). See ${AUTHN_JSON}" | tee -a "${RUN_LOG}"
+      exit 31
+    fi
+
+    # parse sessionToken: prefer python3 single-line; fallback to sed
+    sessionToken=""
+          if command -v python3 >/dev/null 2>&1; then
+        sessionToken=$(python3 -c '
+        import sys, json
+        f = sys.argv[1]
+        try:
+          obj = json.load(open(f))
+          # sessionToken exists on successful password-only authn
+          print(obj.get("sessionToken", "") or "")
+        except Exception:
+          print("")
+        ' "${AUTHN_JSON}" 2>/dev/null || true)
+    else
+        sessionToken=$(sed -n 's/.*"sessionToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${AUTHN_JSON}" || true)
+    fi
+
+    status_val=$(sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${AUTHN_JSON}" || true)
+
+    if [ -z "${sessionToken}" ]; then
+      echo "ERROR: No sessionToken found. Authn status: ${status_val}. See ${AUTHN_JSON} for details." | tee -a "${RUN_LOG}"
+      exit 32
+    fi
+    echo "[2] Obtained sessionToken (len=${#sessionToken})" | tee -a "${RUN_LOG}"
+
+    # -------------------------
+    # 3) Try Sessions API to create a session (no redirectUrl required)
+    #    POST /api/v1/sessions  { "sessionToken": "..."}
+    #    capture Set-Cookie into COOKIE_JAR
+    # -------------------------
+    echo "[3] Creating session via Sessions API (POST /api/v1/sessions)" | tee -a "${RUN_LOG}"
+
+    # Build payload safely and send
+    printf '{"sessionToken":"%s"}\n' "${sessionToken}" > "${LOG_DIR}/sess_payload.json"
+    set +e
+    curl -sS -i -X POST "https://${OKTA_DOMAIN}/api/v1/sessions" \
+      -H "Accept: application/json" -H "Content-Type: application/json" \
+      --data "@${LOG_DIR}/sess_payload.json" \
+      -c "${COOKIE_JAR}" -D "${SESS_HEADERS}" -o "${SESS_JSON}"
+    sess_rc=$?
+    set -e
+    rm -f "${LOG_DIR}/sess_payload.json" || true
+
+    if [ "${sess_rc}" -eq 0 ]; then
+      echo "[3] Sessions API call returned (see ${SESS_JSON} and headers ${SESS_HEADERS})" | tee -a "${RUN_LOG}"
+    else
+      echo "WARNING: Sessions API call failed (curl rc=${sess_rc}). Will try fallback redirect approach." | tee -a "${RUN_LOG}"
+    fi
+
+    # Inspect cookie jar for a session cookie (common name 'sid' or presence of okta domains)
+    cookie_ok=false
+    if [ -f "${COOKIE_JAR}" ] && [ -s "${COOKIE_JAR}" ]; then
+      if grep -qi 'sid' "${COOKIE_JAR}" 2>/dev/null || grep -qi 'okta' "${COOKIE_JAR}" 2>/dev/null || grep -qi 'JSESSIONID' "${COOKIE_JAR}" 2>/dev/null; then
+        cookie_ok=true
+      fi
+    fi
+
+    # -------------------------
+    # 4) Fallback: sessionCookieRedirect to tenant homepage (best-effort)
+    # -------------------------
+    if [ "${cookie_ok}" = false ]; then
+      echo "[4] Sessions API did not yield cookie; attempting sessionCookieRedirect fallback" | tee -a "${RUN_LOG}"
+      set +e
+      curl -sS -i -L -c "${COOKIE_JAR}" "https://${OKTA_DOMAIN}/login/sessionCookieRedirect?token=${sessionToken}&redirectUrl=https://${OKTA_DOMAIN}/app/UserHome" -o /dev/null
+      rc_redirect=$?
+      set -e
+      echo "[4] redirect curl rc=${rc_redirect}" | tee -a "${RUN_LOG}"
+
+      if [ -f "${COOKIE_JAR}" ] && [ -s "${COOKIE_JAR}" ]; then
+        if grep -qi 'sid' "${COOKIE_JAR}" 2>/dev/null || grep -qi 'okta' "${COOKIE_JAR}" 2>/dev/null; then
+          cookie_ok=true
+        fi
+      fi
+    fi
+
+    if [ "${cookie_ok}" = false ]; then
+      echo "ERROR: No session cookie produced by Sessions API or fallback redirect. See ${SESS_HEADERS} and ${SESS_JSON}." | tee -a "${RUN_LOG}"
+      exit 33
+    fi
+
+    echo "[OK] Session cookie captured in ${COOKIE_JAR}" | tee -a "${RUN_LOG}"
+
+    # -------------------------
+    # 5) Verify cookie by accessing TARGET_URL using cookie-jar
+    # -------------------------
+    echo "[5] Verifying access to TARGET_URL (${TARGET_URL}) using cookie jar" | tee -a "${RUN_LOG}"
+    set +e
+    http_code=$(curl -sS -w "%{http_code}" -b "${COOKIE_JAR}" -c "${COOKIE_JAR}" -D "${PROTECTED_HDRS}" -o "${PROTECTED_BODY}" --max-time 30 "${TARGET_URL}")
+    curl_rc=$?
+    set -e
+    echo "[5] curl rc=${curl_rc}, http_code=${http_code}" | tee -a "${RUN_LOG}"
+
+    if [ "${curl_rc}" -ne 0 ]; then
+      echo "ERROR: Protected request failed (curl rc ${curl_rc}). See ${PROTECTED_HDRS} and ${PROTECTED_BODY}" | tee -a "${RUN_LOG}"
+      exit 34
+    fi
+
+    # Accept 2xx/3xx as success
+    first_char="${http_code:0:1}"
+    if [ "${first_char}" != "2" ] && [ "${first_char}" != "3" ]; then
+      echo "ERROR: Protected request returned HTTP ${http_code} — cookie auth may not be valid." | tee -a "${RUN_LOG}"
+      exit 35
+    fi
+
+    echo "[SUCCESS] Protected request returned HTTP ${http_code}. Okta session validated." | tee -a "${RUN_LOG}"
+
+    # Save artifacts for later DAST job to consume
+    cp -v "${AUTHN_JSON}" "${ARTIFACT_DIR}/" || true
+    cp -v "${SESS_JSON}" "${ARTIFACT_DIR}/" || true
+    cp -v "${COOKIE_JAR}" "${ARTIFACT_DIR}/" || true
+    cp -v "${PROTECTED_HDRS}" "${ARTIFACT_DIR}/" || true
+    cp -v "${PROTECTED_BODY}" "${ARTIFACT_DIR}/" || true
+    cp -v "${RUN_LOG}" "${ARTIFACT_DIR}/" || true
+
+    echo "=== Okta session check complete. Artifacts saved under ${ARTIFACT_DIR} ===" | tee -a "${RUN_LOG}"
+    exit 0
