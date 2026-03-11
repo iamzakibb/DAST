@@ -52,7 +52,7 @@ okta_session_no_redirect:
     # Helper: masked env dump for diagnostics (avoid leaking password)
     mask_env() {
       env | sed -E 's/(OKTA_PASSWORD|PASSWORD|PASS|SECRET|TOKEN|KEY)=.*/\1=****MASKED****/Ig'
-
+    }
     # Trap to collect diagnostics & always archive artifacts
 
     finish() {
